@@ -15,11 +15,11 @@
   <a href="#about">About</a> •
   <a href="#getting-started">Getting Started</a> •
   <a href="#license">License</a> •
-  <a href="#contributors">Contributors</a>
+  <a href="#contributors">Contributors</a>  
 </p>
 
 <p align="center">
-  <img src="assets/fall_detection.gif" alt="animated" />
+  <img src="assets/scoring_algorithm.gif" alt="animated" />
 </p>
 
 ## About
