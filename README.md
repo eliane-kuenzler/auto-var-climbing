@@ -23,7 +23,7 @@
 </p>
 
 ## About
-... few sentences about this project and background.
+This research presents an initial approach to developing an automated Video Assistant Referee (VAR) system for lead climbing. The video footage used in this study was recorded by the Swiss Alpine Club (SAC) for judging purposes at two events: the European Climbing Championships in Villars (2024) and the Swiss Lead Championship in Lenzburg (2024). These recordings served as the primary dataset for the research. The videos underwent preprocessing, and BlazePose was employed as the pose estimation model to extract key landmarks. These landmarks were then used to track climbers' movements and calculate relevant features for automated decision-making.
 
 ## Getting Started
 ... all the stuff to get going with this repo. How to use it.
