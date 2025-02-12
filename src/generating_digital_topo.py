@@ -6,6 +6,13 @@ import math
 This script allows you to generate a digital topo.
 You can map all the holds visible in the image by drawing circles around them and annotate the corresponding score.
 The digital topo will then be saved as a json-file and jpg.
+
+Input:
+- Frame of preprocessed climbing video
+
+Output:
+- Annotated climbing image
+- JSON file with hold annotations
 """
 
 # Set the file name (modify this variable to change file paths automatically)

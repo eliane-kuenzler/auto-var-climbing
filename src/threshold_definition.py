@@ -5,11 +5,7 @@ import json
 from pathlib import Path
 import math
 import os
-
-# set all the thresholds as global variables
-control_threshold = 60
-hand_progression_threshold = 0.4
-hip_progression_threshold = 22
+import re
 
 """
 This scrip is here to test all the different variables and set the right thresholds for the plus algorithm.
@@ -102,7 +98,7 @@ def extract_first_frames(data):
     return first_frames
 
 
-def process_video_and_track_holds(input_video_path, input_landmarks_path, annotations_path):
+def process_video_and_track_holds(input_video_path, input_landmarks_path, annotations_path, control_threshold):
     """
     Process the video to detect when holds are gripped by each hand, including duoholds.
 
@@ -110,7 +106,6 @@ def process_video_and_track_holds(input_video_path, input_landmarks_path, annota
         left_hand_holds (dict): {hold_number: first_frame}
         right_hand_holds (dict): {hold_number: first_frame}
     """
-    global control_threshold
 
     # Load landmarks
     landmarks = pd.read_parquet(input_landmarks_path)
@@ -262,7 +257,6 @@ def get_interval_for_plus_progression(left_hand_holds, right_hand_holds, fall_fr
     """
     Determine the interval for plus progression based on the highest controlled hold.
     """
-    global control_threshold
 
     # Merge left and right hand holds
     all_holds = {**left_hand_holds, **right_hand_holds}
@@ -271,7 +265,7 @@ def get_interval_for_plus_progression(left_hand_holds, right_hand_holds, fall_fr
     last_controlled_hold = max(all_holds.keys())
 
     # Get the correct frame number when this hold was first controlled
-    check_start_frame = all_holds[last_controlled_hold] - control_threshold  # Adjust based on testing
+    check_start_frame = all_holds[last_controlled_hold] - 30  # Adjust based on testing
 
     # Adjust check_end_frame by subtracting fall_interval
     check_end_frame = fall_frame - fall_interval  # Adjust based on testing
@@ -480,7 +474,8 @@ def determine_hand_progression(
         check_start_frame,
         check_end_frame,
         width,
-        height
+        height,
+        hand_progression_threshold  # Pass as an argument
 ):
     """
     Determine the progression of the hand that moved during the interval of interest.
@@ -488,7 +483,7 @@ def determine_hand_progression(
     and the next free hold. Also checks if the moving hand has progressed more than half of the
     greater distance in x or y direction during the interval.
 
-    Args
+    Args:
         annotations_path (Path): Path to the annotations file (JSON).
         input_landmarks_path (Path): Path to the landmarks file (Parquet).
         next_free_hold (int): The next free hold number.
@@ -500,13 +495,13 @@ def determine_hand_progression(
         check_end_frame (int): End frame of the interval of interest.
         width (int): Width of the frame for scaling landmarks.
         height (int): Height of the frame for scaling landmarks.
+        hand_progression_threshold (float): The threshold for determining hand progression.
 
     Returns:
         dict: A dictionary containing:
             - greater_distance: {"axis": "x" or "y", "value": distance}
             - hand_progression: True if the moving hand moved more than half of the greater distance, else False.
     """
-    global hand_progression_threshold
 
     # Load annotations
     with open(annotations_path, 'r') as f:
@@ -566,8 +561,7 @@ def determine_hand_progression(
     # Determine the greater distance
     if x_distance > y_distance:
         greater_distance = {"axis": "x", "value": x_distance}
-        threshold_distance = x_distance * hand_progression_threshold  # this can be adjusted ---> determines how much
-        # distance needs to be covered for a +
+        threshold_distance = x_distance * hand_progression_threshold  # Adjusted for input threshold
     else:
         greater_distance = {"axis": "y", "value": y_distance}
         threshold_distance = y_distance * hand_progression_threshold
@@ -607,7 +601,7 @@ def determine_hand_progression(
     }
 
 
-def calculate_hip_progression(input_landmarks_path, start_frame, end_frame, width, height, interval=10):
+def calculate_hip_progression(input_landmarks_path, start_frame, end_frame, width, height, hip_threshold, interval=10):
     """
     Determine if there is sufficient hip movement in the interval before a fall.
 
@@ -617,6 +611,7 @@ def calculate_hip_progression(input_landmarks_path, start_frame, end_frame, widt
         end_frame (int): End frame of the interval of interest.
         width (int): Frame width in pixels (used for scaling).
         height (int): Frame height in pixels (used for scaling).
+        hip_threshold (int): The threshold value to test for hip progression.
         interval (int): Number of frames over which to calculate movement (default is 10).
 
     Returns:
@@ -624,7 +619,6 @@ def calculate_hip_progression(input_landmarks_path, start_frame, end_frame, widt
             - 'left_hip_progression': True if left hip movement exceeds threshold, False otherwise.
             - 'right_hip_progression': True if right hip movement exceeds threshold, False otherwise.
     """
-    global hip_progression_threshold
 
     landmarks = pd.read_parquet(input_landmarks_path)
 
@@ -650,9 +644,9 @@ def calculate_hip_progression(input_landmarks_path, start_frame, end_frame, widt
     left_hip_movement = calculate_movement(left_hip_x[range_indices], left_hip_y[range_indices], interval)
     right_hip_movement = calculate_movement(right_hip_x[range_indices], right_hip_y[range_indices], interval)
 
-    # Check if movement exceeds threshold
-    left_hip_progression = np.any(left_hip_movement > hip_progression_threshold)
-    right_hip_progression = np.any(right_hip_movement > hip_progression_threshold)
+    # Check if movement exceeds the given threshold
+    left_hip_progression = np.any(left_hip_movement > hip_threshold)
+    right_hip_progression = np.any(right_hip_movement > hip_threshold)
 
     return {
         "left_hip_progression": left_hip_progression,
@@ -660,142 +654,420 @@ def calculate_hip_progression(input_landmarks_path, start_frame, end_frame, widt
     }
 
 
+def hip_progression_tuning():
+    """Tunes the hip progression threshold and evaluates accuracy."""
+
+    # Set folder paths
+    video_folder = Path("../data/input/videos/")
+    landmarks_folder = Path("../data/input/landmarks/")
+    annotations_folder = Path("../data/input/topos/")
+
+    # set name of dataframe accordingly to the data sample
+    output_dataframe_path = Path("../data/output/plus_algorithm/hip_threshold_tuning_plus_data.pd")  # Save as .pd
+
+    # Set hip progression thresholds to test
+    hip_threshold_values = list(range(10, 41))  # From 10 to 40, inclusive
+
+    # Function to extract details from the filename
+    def extract_details(video_name):
+        parts = video_name.split("_")
+
+        competition = "lenzburg" if "lenzburg" in parts else "villars" if "villars" in parts else None
+        gender = "male" if "men" in parts else "female" if "women" in parts else None
+
+        athlete_number_match = re.search(r'n(\d+)', video_name)
+        athlete_number = athlete_number_match.group(1) if athlete_number_match else None
+
+        ground_truth_match = re.search(r'(\d+\+?|\d+)', parts[-1])
+        ground_truth = ground_truth_match.group(1) if ground_truth_match else None
+
+        return competition, athlete_number, gender, ground_truth
+
+    # Initialize results list
+    results = []
+
+    # Iterate over all videos in the folder
+    for video_path in video_folder.glob("*.mp4"):
+        file_name = video_path.stem  # Get the filename without extension
+        print(f'Processing video: {file_name}')
+
+        # Generate corresponding file paths
+        input_landmarks_path = landmarks_folder / f"{file_name}_coordinates_local.parquet"
+        annotations_path = annotations_folder / f"{file_name}_annotations.json"
+
+        # Get video frame size
+        capture = cv2.VideoCapture(str(video_path))
+        width, height = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        capture.release()
+
+        # Get filename details
+        competition, athlete_number, gender, ground_truth = extract_details(file_name)
+        ground_truth_plus = "+" in str(ground_truth)
+
+        # Detect holds separately for left and right hands
+        left_hand_holds, right_hand_holds = process_video_and_track_holds(video_path, input_landmarks_path,
+                                                                          annotations_path, control_threshold=60)
+
+        # Detect fall
+        fall_frame, fall_interval = detect_fall(input_landmarks_path)
+
+        if fall_frame is not None:
+            # Determine interval for plus progression
+            check_start_frame, check_end_frame, last_controlled_hold, next_free_hold = get_interval_for_plus_progression(
+                left_hand_holds, right_hand_holds, fall_frame, fall_interval
+            )
+
+            # Loop through different hip progression thresholds
+            for hip_threshold in hip_threshold_values:
+                print(f'Testing hip threshold: {hip_threshold}')
+
+                # Calculate hip progression with the current threshold
+                hip_progression = calculate_hip_progression(
+                    input_landmarks_path, check_start_frame, check_end_frame, width, height, hip_threshold, interval=10
+                )
+
+                # Store the results
+                results.append({
+                    "file_name": file_name,
+                    "hip_progression_threshold": hip_threshold,
+                    "hip_progression": hip_progression["left_hip_progression"] or hip_progression[
+                        "right_hip_progression"],
+                    "ground_truth_score": ground_truth,
+                    "ground_truth_plus": ground_truth_plus
+                })
+
+    # Convert results to DataFrame
+    plus_algorithm_results = pd.DataFrame(results)
+
+    # Save the DataFrame as a .pd file
+    plus_algorithm_results.to_pickle(output_dataframe_path)
+
+    print(f"Results saved to {output_dataframe_path}")
+
+
+def hand_progression_tuning():
+    """Tunes the hand progression threshold and evaluates accuracy."""
+
+    # Set folder paths
+    video_folder = Path("../data/input/videos/")
+    landmarks_folder = Path("../data/input/landmarks/")
+    annotations_folder = Path("../data/input/topos/")
+
+    # Set name of dataframe accordingly to the data sample
+    output_dataframe_path = Path("../data/output/plus_algorithm/hand_threshold_tuning.pd")  # Save as .pd
+
+    # Set hand progression thresholds to test (from 0.1 to 1.0 in steps of 0.1)
+    hand_threshold_values = [x / 10 for x in range(1, 11)]  # Generates [0.1, 0.2, ..., 1.0]
+
+    # Function to extract details from the filename
+    def extract_details(video_name):
+        parts = video_name.split("_")
+
+        competition = "lenzburg" if "lenzburg" in parts else "villars" if "villars" in parts else None
+        gender = "male" if "men" in parts else "female" if "women" in parts else None
+
+        athlete_number_match = re.search(r'n(\d+)', video_name)
+        athlete_number = athlete_number_match.group(1) if athlete_number_match else None
+
+        ground_truth_match = re.search(r'(\d+\+?|\d+)', parts[-1])
+        ground_truth = ground_truth_match.group(1) if ground_truth_match else None
+
+        return competition, athlete_number, gender, ground_truth
+
+    # Initialize results list
+    results = []
+
+    # Iterate over all videos in the folder
+    for video_path in video_folder.glob("*.mp4"):
+        file_name = video_path.stem  # Get the filename without extension
+        print(f'Processing video: {file_name}')
+
+        # Generate corresponding file paths
+        input_landmarks_path = landmarks_folder / f"{file_name}_coordinates_local.parquet"
+        annotations_path = annotations_folder / f"{file_name}_annotations.json"
+
+        # Get video frame size
+        capture = cv2.VideoCapture(str(video_path))
+        width, height = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        capture.release()
+
+        # Get filename details
+        competition, athlete_number, gender, ground_truth = extract_details(file_name)
+        ground_truth_plus = "+" in str(ground_truth)
+
+        # Detect holds separately for left and right hands
+        left_hand_holds, right_hand_holds = process_video_and_track_holds(video_path, input_landmarks_path, annotations_path, control_threshold=60)
+
+        # Detect fall
+        fall_frame, fall_interval = detect_fall(input_landmarks_path)
+
+        if fall_frame is not None:
+            # Determine interval for plus progression
+            check_start_frame, check_end_frame, last_controlled_hold, next_free_hold = get_interval_for_plus_progression(
+                left_hand_holds, right_hand_holds, fall_frame, fall_interval
+            )
+
+            # Get the last controlled holds before the fall
+            left_hand_hold, right_hand_hold = get_hand_positions_at_frame(
+                input_landmarks_path=input_landmarks_path,
+                annotations_path=annotations_path,
+                check_start_frame=check_start_frame,
+                width=width,
+                height=height,
+                last_controlled_hold=last_controlled_hold
+            )
+
+            # Check which hand moved more
+            left_moved, right_moved = check_hand_movement_in_interval(
+                input_landmarks_path, check_start_frame, check_end_frame, width, height
+            )
+
+            # Loop through different hand progression thresholds
+            for hand_threshold in hand_threshold_values:
+                print(f'Testing hand threshold: {hand_threshold}')
+
+                # Calculate hand progression with the current threshold
+                hand_progression = determine_hand_progression(
+                    annotations_path, input_landmarks_path, next_free_hold,
+                    left_hand_hold, right_hand_hold, left_moved, right_moved,
+                    check_start_frame, check_end_frame, width, height,
+                    hand_progression_threshold=hand_threshold  # Pass threshold here
+                )
+
+                # Store the results
+                results.append({
+                    "file_name": file_name,
+                    "hand_progression_threshold": hand_threshold,
+                    "hand_progression": hand_progression["hand_progression"],
+                    "ground_truth_score": ground_truth,
+                    "ground_truth_plus": ground_truth_plus
+                })
+
+    # Convert results to DataFrame
+    plus_algorithm_results = pd.DataFrame(results)
+
+    # Save the DataFrame as a .pd file
+    plus_algorithm_results.to_pickle(output_dataframe_path)
+
+    print(f"Results saved to {output_dataframe_path}")
+
+
+def control_threshold_tuning():
+    """Tunes the control threshold and evaluates accuracy."""
+
+    # Set folder paths
+    video_folder = Path("../data/input/videos/")
+    landmarks_folder = Path("../data/input/landmarks/")
+    annotations_folder = Path("../data/input/topos/")
+
+    # Output file path
+    output_dataframe_path = Path("../data/output/plus_algorithm/control_threshold_tuning.pd")
+
+    # Set control thresholds to test (from 30 to 100 in steps of 10)
+    control_threshold_values = list(range(30, 101, 10))
+
+    # Function to extract details from the filename
+    def extract_details(video_name):
+        parts = video_name.split("_")
+
+        competition = "lenzburg" if "lenzburg" in parts else "villars" if "villars" in parts else None
+        gender = "male" if "men" in parts else "female" if "women" in parts else None
+
+        athlete_number_match = re.search(r'n(\d+)', video_name)
+        athlete_number = athlete_number_match.group(1) if athlete_number_match else None
+
+        ground_truth_match = re.search(r'(\d+\+?|\d+)', parts[-1])
+        ground_truth = ground_truth_match.group(1) if ground_truth_match else None
+
+        return competition, athlete_number, gender, ground_truth
+
+    # Initialize results list
+    results = []
+
+    # Iterate over all videos in the folder
+    for video_path in video_folder.glob("*.mp4"):
+        file_name = video_path.stem  # Get filename without extension
+        print(f'Processing video: {file_name}')
+
+        # Generate corresponding file paths
+        input_landmarks_path = landmarks_folder / f"{file_name}_coordinates_local.parquet"
+        annotations_path = annotations_folder / f"{file_name}_annotations.json"
+
+        # Get video frame size
+        capture = cv2.VideoCapture(str(video_path))
+        width, height = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        capture.release()
+
+        # Get filename details
+        competition, athlete_number, gender, ground_truth = extract_details(file_name)
+
+        # Convert ground truth to numeric by removing the "+" sign
+        ground_truth_control = int(re.sub(r'\+', '', ground_truth)) if ground_truth else None
+
+        # Loop through different control thresholds
+        for control_threshold in control_threshold_values:
+            print(f'Testing control threshold: {control_threshold}')
+
+            # Process holds with the current control threshold
+            left_hand_holds, right_hand_holds = process_video_and_track_holds(video_path, input_landmarks_path,
+                                                                              annotations_path, control_threshold)
+
+            # Merge left and right hand holds
+            all_holds = {**left_hand_holds, **right_hand_holds}
+
+            # Get the last controlled hold
+            last_controlled_hold = max(all_holds.keys()) if all_holds else None
+
+            # Store the results
+            results.append({
+                "file_name": file_name,
+                "control_threshold": control_threshold,
+                "last_controlled_hold": last_controlled_hold,
+                "ground_truth_score": ground_truth,
+                "ground_truth_control": ground_truth_control
+            })
+
+    # Convert results to DataFrame
+    control_algorithm_results = pd.DataFrame(results)
+
+    # Save the DataFrame as a .pd file
+    control_algorithm_results.to_pickle(output_dataframe_path)
+
+    print(f"Results saved to {output_dataframe_path}")
+
+
 def main():
-    file_name = 'edited_villars_men_semifinals_n106_plus_16+'
+    """Runs the full algorithm on all videos and saves results to a dataframe."""
 
-    # Automatically generated paths based on the file name
-    input_video_path = f'../data/input/videos/{file_name}.mp4'
-    input_landmarks_path = f'../data/input/landmarks/{file_name}_coordinates_local.parquet'
-    annotations_path = f'../data/input/topos/{file_name}_annotations.json'
-    # dataframe_path = '../data/output/plus_algorithm/results_algorithm_performance.pd'
+    # Set thresholds
+    control_threshold = 60
+    hand_progression_threshold = 0.4
+    hip_progression_threshold = 22
 
-    # -------------------------------------------------------------------------------------
+    # Set folder paths
+    video_folder = Path("../data/input/videos/")
+    landmarks_folder = Path("../data/input/landmarks/")
+    annotations_folder = Path("../data/input/topos/")
+    output_dataframe_path = Path("../data/output/plus_algorithm/final_algorithm_results.pd")
 
-    # Get the frame dimensions
-    capture = cv2.VideoCapture(input_video_path)
-    width, height = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    capture.release()
+    # Function to extract details from the filename
+    def extract_details(video_name):
+        parts = video_name.split("_")
 
-    # Print out total number of frames of the input video
-    total_frames = get_total_frames(input_video_path)
-    print(f"Total number of frames: {total_frames}")
+        competition = "lenzburg" if "lenzburg" in parts else "villars" if "villars" in parts else None
+        gender = "male" if "men" in parts else "female" if "women" in parts else None
 
-    # Detect holds separately for left and right hands
-    left_hand_holds, right_hand_holds = process_video_and_track_holds(input_video_path, input_landmarks_path,
-                                                                      annotations_path)
+        athlete_number_match = re.search(r'n(\d+)', video_name)
+        athlete_number = athlete_number_match.group(1) if athlete_number_match else None
 
-    # Print frame numbers for left and right hand holds
-    print("\nLeft Hand Holds (Frame Number - Hold Number):")
-    for hold, frame in left_hand_holds.items():
-        print(f"Frame {frame} - Hold {hold}")
+        ground_truth_match = re.search(r'(\d+\+?|\d+)', parts[-1])
+        ground_truth = ground_truth_match.group(1) if ground_truth_match else None
+        ground_truth_control = int(ground_truth.replace("+", "")) if ground_truth else None
+        ground_truth_plus = "+" in str(ground_truth)
 
-    print("\nRight Hand Holds (Frame Number - Hold Number):")
-    for hold, frame in right_hand_holds.items():
-        print(f"Frame {frame} - Hold {hold}")
+        return competition, athlete_number, gender, ground_truth, ground_truth_control, ground_truth_plus
 
-    # Print out at what frame number the fall was detected and give the interval of interest
-    fall_frame, fall_interval = detect_fall(input_landmarks_path)
+    # Initialize results list
+    results = []
 
-    if fall_frame is not None:
-        print(f"Fall detected starting at frame: {fall_frame}")
+    # Iterate over all videos in the folder
+    for video_path in video_folder.glob("*.mp4"):
+        file_name = video_path.stem  # Get the filename without extension
+        print(f'Processing video: {file_name}')
 
-        # Get progression interval based on the last controlled hold
-        check_start_frame, check_end_frame, last_controlled_hold, next_free_hold = get_interval_for_plus_progression(
-            left_hand_holds, right_hand_holds, fall_frame, fall_interval
+        # Generate corresponding file paths
+        input_landmarks_path = landmarks_folder / f"{file_name}_coordinates_local.parquet"
+        annotations_path = annotations_folder / f"{file_name}_annotations.json"
+
+        # Get video frame size
+        capture = cv2.VideoCapture(str(video_path))
+        width, height = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        capture.release()
+
+        # Extract filename details
+        competition, athlete_number, gender, ground_truth_score, ground_truth_control, ground_truth_plus = extract_details(file_name)
+
+        # Detect holds separately for left and right hands
+        left_hand_holds, right_hand_holds = process_video_and_track_holds(
+            video_path, input_landmarks_path, annotations_path, control_threshold=control_threshold
         )
 
-        print(f"Interval for plus progression: {check_start_frame} - {check_end_frame}")
-        print(f"Last controlled hold: {last_controlled_hold}, Next free hold: {next_free_hold}")
+        # Detect fall
+        fall_frame, fall_interval = detect_fall(input_landmarks_path)
 
-        # Call check_hand_movement_in_interval function with the interval of interest
-        left_moved, right_moved = check_hand_movement_in_interval(input_landmarks_path, check_start_frame,
-                                                                  check_end_frame, width, height)
-        print(f"Left hand moved more: {left_moved}")
-        print(f"Right hand moved more: {right_moved}")
+        if fall_frame is not None:
+            # Determine interval for plus progression
+            check_start_frame, check_end_frame, last_controlled_hold, next_free_hold = get_interval_for_plus_progression(
+                left_hand_holds, right_hand_holds, fall_frame, fall_interval
+            )
 
-        # Get the last holds gripped for each hand before the fall
-        left_hand_hold, right_hand_hold = get_hand_positions_at_frame(
-            input_landmarks_path=input_landmarks_path,
-            annotations_path=annotations_path,
-            check_start_frame=check_start_frame,
-            width=width,
-            height=height,
-            last_controlled_hold=last_controlled_hold,  # Pass last controlled hold here!
-            lookback_frames=200  # Adjust as needed
-        )
+            # Get the last controlled holds before the fall
+            left_hand_hold, right_hand_hold = get_hand_positions_at_frame(
+                input_landmarks_path=input_landmarks_path,
+                annotations_path=annotations_path,
+                check_start_frame=check_start_frame,
+                width=width,
+                height=height,
+                last_controlled_hold=last_controlled_hold
+            )
 
-        print(f"Left hand at hold: {left_hand_hold}")
-        print(f"Right hand at hold: {right_hand_hold}")
+            # Check which hand moved more
+            left_moved, right_moved = check_hand_movement_in_interval(
+                input_landmarks_path, check_start_frame, check_end_frame, width, height
+            )
 
-        # Determine hand progression
-        hand_progression = determine_hand_progression(
-            annotations_path, input_landmarks_path, next_free_hold, left_hand_hold, right_hand_hold,
-            left_moved, right_moved, check_start_frame, check_end_frame, width, height
-        )
-        print(f"Greater distance: {hand_progression['greater_distance']}")
-        print(f"Hand progression: {'Yes' if hand_progression['hand_progression'] else 'No'}")
+            # Determine hand progression
+            hand_progression = determine_hand_progression(
+                annotations_path, input_landmarks_path, next_free_hold,
+                left_hand_hold, right_hand_hold, left_moved, right_moved,
+                check_start_frame, check_end_frame, width, height,
+                hand_progression_threshold=hand_progression_threshold  # Pass threshold here
+            )
 
-        # Calculate hip progression
-        hip_progression = calculate_hip_progression(
-            input_landmarks_path, check_start_frame, check_end_frame, width, height, interval=10)
-        print(f"Left Hip Progression: {'Yes' if hip_progression['left_hip_progression'] else 'No'}")
-        print(f"Right Hip Progression: {'Yes' if hip_progression['right_hip_progression'] else 'No'}")
+            # Calculate hip progression
+            hip_progression = calculate_hip_progression(
+                input_landmarks_path, check_start_frame, check_end_frame, width, height,
+                hip_threshold=hip_progression_threshold, interval=10
+            )
 
-        # Final decision: Determine if it was a "plus"
-        is_plus = (
-                hand_progression['hand_progression'] and
-                (hip_progression['left_hip_progression'] or hip_progression['right_hip_progression'])
-        )
+            # Determine final plus decision
+            is_plus = (
+                hand_progression["hand_progression"] and
+                (hip_progression["left_hip_progression"] or hip_progression["right_hip_progression"])
+            )
 
-        if is_plus:
-            print("plus")
-            print(f"Final score: {last_controlled_hold}+")
-            final_score = f"{last_controlled_hold}+"
-        else:
-            print("no plus")
-            print(f"Final score: {last_controlled_hold}")
-            final_score = int(last_controlled_hold)
+            # Assign final score
+            if is_plus:
+                print("plus")
+                print(f"Final score: {last_controlled_hold}+")
+                final_score = f"{last_controlled_hold}+"
+            else:
+                print("no plus")
+                print(f"Final score: {last_controlled_hold}")
+                final_score = int(last_controlled_hold)
 
-    else:
-        print("No fall detected.")
+            # Store the results
+            results.append({
+                "file_name": file_name,
+                "last_controlled_hold": last_controlled_hold,
+                "hip_progression": hip_progression["left_hip_progression"] or hip_progression["right_hip_progression"],
+                "hand_progression": hand_progression["hand_progression"],
+                "ground_truth_score": ground_truth_score,
+                "ground_truth_control": ground_truth_control,
+                "ground_truth_plus": ground_truth_plus,
+                "plus": is_plus,
+                "final_score": final_score
+            })
 
-    """
-    if fall_frame is not None:
-        # Collect results in a dictionary
-        results = {
-            "video_name": file_name,
-            "fall_frame": fall_frame,
-            "last_controlled_hold": last_controlled_hold,
-            "next_free_hold": next_free_hold,
-            "hand_progression": hand_progression['hand_progression'],
-            "hip_progression": (hip_progression['left_hip_progression'] or hip_progression['right_hip_progression']),
-            "plus": is_plus,
-            "final_score": final_score
-        }
+    # Convert results to DataFrame
+    final_algorithm_results = pd.DataFrame(results)
 
-        # Create or load the DataFrame
-        if os.path.exists(dataframe_path):
-            plus_algorithm_results = pd.read_pickle(dataframe_path)
-        else:
-            plus_algorithm_results = pd.DataFrame(columns=["video_name", "fall_frame", "last_controlled_hold",
-                                                           "next_free_hold", "hand_progression", "hip_progression",
-                                                           "plus"])
+    # Save the DataFrame as a .pd file
+    final_algorithm_results.to_pickle(output_dataframe_path)
 
-        # Update or add the result
-        if file_name in plus_algorithm_results["video_name"].values:
-            # Update the existing row
-            for key, value in results.items():
-                plus_algorithm_results.loc[plus_algorithm_results["video_name"] == file_name, key] = value
-        else:
-            # Add a new row
-            plus_algorithm_results = pd.concat([plus_algorithm_results, pd.DataFrame([results])], ignore_index=True)
+    print(f"Results saved to {output_dataframe_path}")
 
-        # Save the updated DataFrame
-        plus_algorithm_results.to_pickle(dataframe_path)
-
-        # Print confirmation
-        print(f"Results saved to {dataframe_path}")
-    """
 
 if __name__ == "__main__":
     main()
+
